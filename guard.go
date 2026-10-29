@@ -127,6 +127,84 @@ func (g *Guard) run(ctx context.Context, k kind, sql string, params ...string) (
 	return res, nil
 }
 
+// ListTables lists the tables and views this role can read, with Postgres' row estimates.
+func (g *Guard) ListTables(ctx context.Context) (*Result, error) {
+	return g.run(ctx, direct, `
+		SELECT n.nspname AS schema, c.relname AS name,
+		       CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' WHEN 'v' THEN 'view'
+		                      WHEN 'm' THEN 'materialized view' WHEN 'f' THEN 'foreign table' END AS kind,
+		       CASE WHEN c.relkind IN ('v', 'f') OR c.reltuples < 0 THEN '' ELSE c.reltuples::bigint::text END AS estimated_rows
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT c.relispartition
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg_toast%'
+		  AND has_table_privilege(c.oid, 'SELECT')
+		ORDER BY 1, 2`)
+}
+
+// DescribeTable shows columns, constraints and indexes. The name is a bound parameter cast to
+// regclass, so it resolves like it would in SQL (search_path, "Quoted" names) and can't inject.
+func (g *Guard) DescribeTable(ctx context.Context, table string) (string, error) {
+	sections := []struct{ title, sql string }{
+		{"Columns", `
+			SELECT a.attname AS column, format_type(a.atttypid, a.atttypmod) AS type,
+			       CASE WHEN a.attnotnull THEN 'not null' ELSE '' END AS nullable,
+			       coalesce(pg_get_expr(d.adbin, d.adrelid), '') AS "default"
+			FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+			WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped
+			ORDER BY a.attnum`},
+		{"Constraints", `
+			SELECT conname AS name, pg_get_constraintdef(oid) AS definition
+			FROM pg_constraint WHERE conrelid = $1::regclass ORDER BY contype, conname`},
+		{"Indexes", `
+			SELECT i.relname AS name, pg_get_indexdef(x.indexrelid) AS definition
+			FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid
+			WHERE x.indrelid = $1::regclass ORDER BY i.relname`},
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "## %s\n", table)
+	for _, s := range sections {
+		res, err := g.run(ctx, direct, s.sql, table)
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&b, "\n### %s\n\n", s.title)
+		if len(res.Rows) == 0 {
+			b.WriteString("(none)\n")
+			continue
+		}
+		b.WriteString(res.Markdown() + "\n")
+	}
+	return b.String(), nil
+}
+
+// Explain returns the query plan. With analyze the query really runs, still read-only and time-limited.
+func (g *Guard) Explain(ctx context.Context, sql string, analyze bool) (string, error) {
+	k, sql, err := classify(sql)
+	if err != nil {
+		return "", err
+	}
+	if k != viaCursor {
+		return "", errors.New("explain takes a SELECT, WITH, VALUES or TABLE statement")
+	}
+	opts := "FORMAT TEXT"
+	if analyze {
+		opts = "ANALYZE, BUFFERS, FORMAT TEXT"
+	}
+	res, err := g.run(ctx, direct, "EXPLAIN ("+opts+") "+sql)
+	if err != nil {
+		return "", err
+	}
+	lines := make([]string, len(res.Rows))
+	for i, r := range res.Rows {
+		lines[i] = r[0]
+	}
+	plan := strings.Join(lines, "\n")
+	if res.Truncated {
+		plan += fmt.Sprintf("\n… plan cut after %d lines", len(lines))
+	}
+	return plan, nil
+}
+
 // classify allowlists read statements by their first keyword and trims trailing semicolons.
 func classify(sql string) (kind, string, error) {
 	sql = strings.TrimRight(strings.TrimSpace(sql), "; \t\r\n")

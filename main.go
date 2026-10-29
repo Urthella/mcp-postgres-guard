@@ -20,6 +20,15 @@ type queryInput struct {
 	SQL string `json:"sql" jsonschema:"one read-only SQL statement: SELECT, WITH, VALUES, TABLE, SHOW or EXPLAIN"`
 }
 
+type describeInput struct {
+	Table string `json:"table" jsonschema:"table or view name, optionally schema-qualified like public.users"`
+}
+
+type explainInput struct {
+	SQL     string `json:"sql" jsonschema:"the SELECT statement to explain"`
+	Analyze bool   `json:"analyze,omitempty" jsonschema:"also run it to get real timings and row counts (still read-only and time-limited)"`
+}
+
 func newServer(g *Guard) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "mcp-postgres-guard", Version: version}, nil)
 	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true}
@@ -36,6 +45,42 @@ func newServer(g *Guard) *mcp.Server {
 			return nil, nil, err
 		}
 		return text(res.Markdown()), nil, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "list_tables",
+		Description: "List the tables and views this connection can read, with Postgres' row estimates. Start here to learn the schema.",
+		Annotations: readOnly,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		res, err := g.ListTables(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(res.Markdown()), nil, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "describe_table",
+		Description: "Show a table's columns with types, nullability and defaults, plus its constraints (keys, foreign keys, checks) and indexes.",
+		Annotations: readOnly,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in describeInput) (*mcp.CallToolResult, any, error) {
+		out, err := g.DescribeTable(ctx, in.Table)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(out), nil, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "explain",
+		Description: "Show the query plan for a SELECT, to check index use before running something heavy. Set analyze to run it and get real timings.",
+		Annotations: readOnly,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in explainInput) (*mcp.CallToolResult, any, error) {
+		plan, err := g.Explain(ctx, in.SQL, in.Analyze)
+		if err != nil {
+			return nil, nil, err
+		}
+		return text(plan), nil, nil
 	})
 
 	return s
