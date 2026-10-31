@@ -65,7 +65,12 @@ Connections show up as `application_name = mcp-postgres-guard` in `pg_stat_activ
 
 | Tool | |
 |---|---|
+| `list_tables` | Tables and views the role can read, with Postgres' row estimates. The agent's starting point |
+| `describe_table` | Columns (type, nullability, default), constraints and indexes. The name is a bound parameter, so it can't inject |
 | `query` | Run one read-only statement, results as a Markdown table, with a note when rows were cut |
+| `explain` | Query plan for a `SELECT`; with `analyze` it runs for real timings, still read-only and time-limited |
+
+All four are marked `readOnlyHint` in their MCP annotations, so clients can auto-approve them.
 
 ## Develop
 
